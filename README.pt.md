@@ -204,7 +204,7 @@ Notas:
 - O Docker pode pôr a política FORWARD do ip6tables em `DROP`. Nesse caso, permite o tráfego rede local → router com `sudo ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`. Esta regra perde-se ao reiniciar; vê abaixo como a tornar permanente.
 - Numa máquina que **não** use NetworkManager, ativar o encaminhamento faz o kernel ignorar os RAs, a não ser que também definas `net.ipv6.conf.eth0.accept_ra=2`. Caso contrário, a máquina perde o seu próprio endereço IPv6. O NetworkManager trata dos RAs ele próprio, por isso não é afetado.
 
-Para tornar a regra do Docker permanente, cria uma pequena unidade systemd que corre depois de o Docker arrancar:
+Se `sudo ip6tables -S FORWARD` mostrar `-P FORWARD DROP` e adicionaste a regra acima, torna-a permanente com uma pequena unidade systemd que corre sempre que o Docker arranca:
 
 ```ini
 # /etc/systemd/system/docker-ipv6-forward.service
@@ -212,14 +212,16 @@ Para tornar a regra do Docker permanente, cria uma pequena unidade systemd que c
 Description=Allow IPv6 LAN to router forwarding past Docker's firewall
 After=docker.service
 Requires=docker.service
+PartOf=docker.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c 'ip6tables -C DOCKER-USER -i eth0 -o eth0 -j ACCEPT 2>/dev/null || ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT'
+ExecStop=-/bin/sh -c 'ip6tables -D DOCKER-USER -i eth0 -o eth0 -j ACCEPT'
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=docker.service
 ```
 
 ```bash
