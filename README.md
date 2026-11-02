@@ -70,7 +70,7 @@ $ rdisc6 eth0
 
 (`2001:db8::/32` is a documentation prefix standing in for your real one. The two DNS servers are Digi's real resolvers.)
 
-Every client picks these up. Android *only* uses RDNSS for IPv6 DNS, and Linux, Windows, macOS and iOS will all happily use them alongside (or almost certainly, instead of) your Pi-hole. Your filtering now has a hole the size of your ISP.
+Every client picks these up. Android *only* uses RDNSS for IPv6 DNS, and Linux, Windows, macOS and iOS will all happily use them alongside, and often instead of, your Pi-hole. Your filtering now has a hole the size of your ISP.
 
 ### What doesn't fix it
 
@@ -138,7 +138,7 @@ In practice the Pi-hole host carries very little of the traffic. It forwards pac
   - **RA** unchecked on all other LAN ports and **all SSIDs**.
   - **DHCPv6** unchecked everywhere (including the Pi-hole host).
 
-Click **Apply** under *each* section you change. The ZTE might save them separately (or not, who knows).
+Each section has its own **Apply** button, and it only saves that section. Click it after changing each one.
 
 While you're there, check the router's **IPv6 firewall** level. Once IPv6 is on, every device has a public address, and inbound filtering is the router's job.
 
@@ -160,7 +160,9 @@ With Option A in step 4, nothing else is needed: Pi-hole's generated dnsmasq con
 
 #### Why not the global address?
 
-Pi-hole's same line also advertises one of the host's global addresses (the `[::]`), and that's what I relied on at first. It works, but it isn't something to depend on:
+Short version: under Option A, clients still receive one of the host's global addresses as a DNS server, because Pi-hole generates that line. The ULA doesn't remove the stale-address problem; it makes it harmless.
+
+Pi-hole's `option6:dns-server` line also advertises one of the host's global addresses (the `[::]`), and that's what I relied on at first. It works, but it isn't something to depend on:
 
 - The global address changes with the prefix, i.e. on every router reboot and WAN reconnect.
 - After a prefix change, dnsmasq kept advertising an **old, deprecated** global address, even while a newer one was current. It only switched after the host's network connection was restarted (`nmcli con up`). Deprecated addresses expire within a couple of hours, after which clients could be left with a DNS server that no longer exists.
@@ -197,8 +199,33 @@ sudo sysctl --system
 Notes:
 
 - If you use Tailscale as a subnet router or exit node, forwarding is probably already on.
-- Docker may set the ip6tables FORWARD policy to `DROP`. If so, allow LAN → router traffic, e.g. `sudo ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`.
+- Docker may set the ip6tables FORWARD policy to `DROP`. If so, allow LAN → router traffic with `sudo ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`. That rule is lost on reboot; see below to make it permanent.
 - On a host **not** using NetworkManager, enabling forwarding makes the kernel ignore RAs unless you also set `net.ipv6.conf.eth0.accept_ra=2`. Otherwise the host loses its own IPv6 address. NetworkManager handles RAs itself, so it isn't affected.
+
+To make the Docker rule permanent, add a small systemd unit that runs after Docker starts:
+
+```ini
+# /etc/systemd/system/docker-ipv6-forward.service
+[Unit]
+Description=Allow IPv6 LAN to router forwarding past Docker's firewall
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip6tables -C DOCKER-USER -i eth0 -o eth0 -j ACCEPT 2>/dev/null || ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT'
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now docker-ipv6-forward.service
+```
+
+`netfilter-persistent save` also works, but it saves Docker's own rules too, and restoring those at boot can clash with the ones Docker creates.
 
 ### 4. Pi-hole: send the RAs
 
@@ -218,10 +245,10 @@ Settings → All settings (expert) → Miscellaneous → `misc.dnsmasq_lines`:
 enable-ra
 dhcp-range=::,constructor:eth0,ra-only
 ra-param=eth0,60,1800
-dhcp-option=option6:dns-server,[fd00:c0c0::53],[fe80::]
+dhcp-option=option6:dns-server,[fd00::],[fe80::]
 ```
 
-`constructor:eth0` copies the prefixes currently on `eth0`, so prefix changes are followed automatically. `ra-param` sets a 60 s RA interval and an 1800 s router lifetime. The `dhcp-option` line advertises the ULA from step 2 and the host's link-local address as DNS servers; with Pi-hole's DHCP server off, Pi-hole doesn't generate this line itself.
+`constructor:eth0` copies the prefixes currently on `eth0`, so prefix changes are followed automatically. `ra-param` sets a 60 s RA interval and an 1800 s router lifetime. The `dhcp-option` line advertises the host's ULA (`[fd00::]`, the address from step 2) and its link-local address (`[fe80::]`) as DNS servers, the same placeholders Pi-hole uses for Option A; with Pi-hole's DHCP server off, Pi-hole doesn't generate this line itself.
 
 For plain dnsmasq (no Pi-hole), Option B's lines work in a dnsmasq config file as-is.
 
@@ -283,7 +310,7 @@ No manual intervention needed.
 
 ## Caveats
 
-- **The Pi-hole host is now your IPv6 gateway.** If it's down, clients lose IPv6 (and probably IPv4, so hmm, time for a picnic).
+- **The Pi-hole host is now your IPv6 gateway, and your DNS.** If it's down, clients lose IPv6 and DNS (and, with Option A, eventually their IPv4 leases). In practice: no internet. Time for a picnic.
 - **Port isolation matters.** Anything sharing the Pi-hole host's router port (e.g. via a switch) also hears the ZTE's RAs and gets Digi's DNS.
 - **Pi-hole stats get noisier.** Clients use rotating IPv6 privacy addresses, so per-client stats for IPv6 queries won't map neatly to devices.
 - **DoH/DoT still bypass Pi-hole**, same as on IPv4. That's a separate problem.

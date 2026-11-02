@@ -72,7 +72,7 @@ $ rdisc6 eth0
 
 (`2001:db8::/32` es un prefijo de documentación que sustituye a tu prefijo real. Los dos servidores DNS son los servidores reales de Digi.)
 
-Todos los clientes los reciben. Android *solo* usa RDNSS para el DNS IPv6, y Linux, Windows, macOS e iOS los usan tan tranquilos junto a tu Pi-hole (o, casi seguro, en su lugar). Tu filtrado tiene ahora un agujero del tamaño de tu ISP.
+Todos los clientes los reciben. Android *solo* usa RDNSS para el DNS IPv6, y Linux, Windows, macOS e iOS los usan tan tranquilos junto a tu Pi-hole, y a menudo en su lugar. Tu filtrado tiene ahora un agujero del tamaño de tu ISP.
 
 ### Lo que no funciona
 
@@ -140,7 +140,7 @@ En la práctica, el equipo del Pi-hole apenas transporta tráfico. Como reenvía
   - **RA** desmarcado en todos los demás puertos LAN y en **todos los SSID**.
   - **DHCPv6** desmarcado en todos (incluido el puerto del equipo del Pi-hole).
 
-Pulsa **Apply** en *cada* sección que cambies. Puede que el ZTE las guarde por separado (o no, vete a saber).
+Cada sección tiene su propio botón **Apply**, que solo guarda esa sección. Púlsalo después de cambiar cada una.
 
 Ya que estás, revisa el nivel del **firewall IPv6** del router. Con IPv6 activado, todos los dispositivos tienen una dirección pública, y filtrar el tráfico entrante es cosa del router.
 
@@ -162,7 +162,9 @@ Con la Opción A del paso 4 no hace falta nada más: la configuración de dnsmas
 
 #### ¿Por qué no la dirección global?
 
-Esa misma línea de Pi-hole anuncia también una de las direcciones globales del equipo (el `[::]`), y al principio me fiaba de eso. Funciona, pero no conviene depender de ello:
+En resumen: con la Opción A, los clientes siguen recibiendo una de las direcciones globales del equipo como servidor DNS, porque es Pi-hole quien genera esa línea. La ULA no elimina el problema de la dirección desactualizada; lo vuelve inofensivo.
+
+La línea `option6:dns-server` de Pi-hole anuncia también una de las direcciones globales del equipo (el `[::]`), y al principio me fiaba de eso. Funciona, pero no conviene depender de ello:
 
 - La dirección global cambia con el prefijo, es decir, con cada reinicio del router y cada reconexión de la WAN.
 - Tras un cambio de prefijo, dnsmasq siguió anunciando una dirección global **antigua y obsoleta**, aunque ya había una más reciente en uso. Solo cambió después de reiniciar la conexión de red del equipo (`nmcli con up`). Las direcciones obsoletas caducan al cabo de unas dos horas, y a partir de ahí los clientes podrían quedarse con un servidor DNS que ya no existe.
@@ -199,8 +201,33 @@ sudo sysctl --system
 Notas:
 
 - Si usas Tailscale como subnet router o exit node, probablemente el reenvío ya está activado.
-- Docker puede poner la política FORWARD de ip6tables en `DROP`. En ese caso, permite el tráfico red local → router, por ejemplo `sudo ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`.
+- Docker puede poner la política FORWARD de ip6tables en `DROP`. En ese caso, permite el tráfico red local → router con `sudo ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT`. Esa regla se pierde al reiniciar; más abajo se explica cómo hacerla permanente.
 - En un equipo que **no** use NetworkManager, activar el reenvío hace que el kernel ignore los RA, salvo que también configures `net.ipv6.conf.eth0.accept_ra=2`. Si no, el equipo pierde su propia dirección IPv6. NetworkManager gestiona los RA por su cuenta, así que no le afecta.
+
+Para que la regla de Docker sea permanente, crea una pequeña unidad de systemd que se ejecute después de que arranque Docker:
+
+```ini
+# /etc/systemd/system/docker-ipv6-forward.service
+[Unit]
+Description=Allow IPv6 LAN to router forwarding past Docker's firewall
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip6tables -C DOCKER-USER -i eth0 -o eth0 -j ACCEPT 2>/dev/null || ip6tables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT'
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now docker-ipv6-forward.service
+```
+
+`netfilter-persistent save` también sirve, pero guarda también las reglas del propio Docker, y restaurarlas al arrancar puede chocar con las que crea Docker.
 
 ### 4. Pi-hole: enviar los RA
 
@@ -220,10 +247,10 @@ Settings → All settings (expert) → Miscellaneous → `misc.dnsmasq_lines`:
 enable-ra
 dhcp-range=::,constructor:eth0,ra-only
 ra-param=eth0,60,1800
-dhcp-option=option6:dns-server,[fd00:c0c0::53],[fe80::]
+dhcp-option=option6:dns-server,[fd00::],[fe80::]
 ```
 
-`constructor:eth0` copia los prefijos que haya en cada momento en `eth0`, así que los cambios de prefijo se siguen automáticamente. `ra-param` fija un intervalo de 60 s entre RA y un tiempo de vida de router de 1800 s. La línea `dhcp-option` anuncia como servidores DNS la ULA del paso 2 y la dirección link-local del equipo; con el servidor DHCP de Pi-hole desactivado, Pi-hole no genera esta línea por sí solo.
+`constructor:eth0` copia los prefijos que haya en cada momento en `eth0`, así que los cambios de prefijo se siguen automáticamente. `ra-param` fija un intervalo de 60 s entre RA y un tiempo de vida de router de 1800 s. La línea `dhcp-option` anuncia como servidores DNS la ULA del equipo (`[fd00::]`, la dirección del paso 2) y su dirección link-local (`[fe80::]`), los mismos marcadores que usa Pi-hole en la Opción A; con el servidor DHCP de Pi-hole desactivado, Pi-hole no genera esta línea por sí solo.
 
 Con dnsmasq a secas (sin Pi-hole), las líneas de la Opción B funcionan tal cual en un archivo de configuración de dnsmasq.
 
@@ -285,7 +312,7 @@ No hace falta intervención manual.
 
 ## Advertencias
 
-- **El equipo del Pi-hole pasa a ser tu puerta de enlace IPv6.** Si se cae, los clientes pierden el IPv6 (y probablemente el IPv4, así que, hmm, hora de irse de pícnic).
+- **El equipo del Pi-hole pasa a ser tu puerta de enlace IPv6, y tu DNS.** Si se cae, los clientes pierden el IPv6 y el DNS (y, con la Opción A, acaban perdiendo las concesiones DHCP de IPv4). En la práctica: sin internet. Hora de irse de pícnic.
 - **El aislamiento del puerto importa.** Todo lo que comparta el puerto del router del equipo del Pi-hole (por ejemplo, a través de un switch) también oye los RA del ZTE y recibe el DNS de Digi.
 - **Las estadísticas de Pi-hole se vuelven más confusas.** Los clientes usan direcciones IPv6 de privacidad que van rotando, así que las estadísticas por cliente de las consultas IPv6 no se corresponden limpiamente con dispositivos.
 - **DoH/DoT siguen saltándose Pi-hole**, igual que en IPv4. Eso es otro problema.
